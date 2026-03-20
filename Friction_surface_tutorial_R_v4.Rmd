@@ -680,8 +680,9 @@ download.file(
 # Extract the zip file
 unzip("rtravelcost-main.zip", exdir="rtravelcost-main")
 library(devtools)
-# Save original working directory
-install(paste0(dirname(getActiveDocumentContext()$path),'\\rtravelcost-main\\rtravelcost-main'))
+pkg_path <- file.path(dirname(rstudioapi::getActiveDocumentContext()$path), "rtravelcost-main", "rtravelcost-main")
+cat(pkg_path, "\n")
+install(pkg_path)
 ```
 
 After installing the custom R library called rtravelcost, we will now load it.
