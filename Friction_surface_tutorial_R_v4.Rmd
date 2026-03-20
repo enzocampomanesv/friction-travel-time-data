@@ -1,0 +1,756 @@
+---
+title: "Friction Surface and Travel Time Tutorial"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+---
+
+# Friction surface and travel time tutorial
+
+## Data Preparation
+
+First, we set up the working directory. This would be the current folder where this script is located.
+
+```{r, setup, results = FALSE, results = FALSE, warning = FALSE, message= FALSE}
+library(rstudioapi)
+knitr::opts_knit$set(root.dir = dirname(getActiveDocumentContext()$path))
+```
+
+Now we will download and extract the zip file containing all the datasets required for this exercise. The downloaded file should be around 67 Mb.
+
+```{r download data, results = FALSE, warning = FALSE, message= FALSE}
+# Download the zip file from GitHub
+download.file(
+  "https://github.com/enzocampomanesv/friction-travel-time-data/blob/main/dataset/friction-travel-time-dataset.zip?raw=TRUE",
+  "friction-travel-time-dataset.zip",
+  mode = "wb"
+)
+# Extract the zip file
+unzip("friction-travel-time-dataset.zip", exdir="Data")
+
+```
+
+We also prepare all the output folders ahead.
+
+```{r make output folders, results = FALSE, warning = FALSE, message= FALSE}
+dir.create("Data/Processed/")
+subfolder_names <- c("rElevation","rFriction_100m","rLandcover","rLandcover_merge","rSlope",
+                     "vRoads","vWater_lines","vWater_poly") 
+for (j in 1:length(subfolder_names)){
+  dir.create(paste0("Data/Processed/",subfolder_names[j]))
+}
+```
+
+Then we import the libraries needed and clear any existing variables in the R environment.  
+
+```{r import libs, results = FALSE, warning = FALSE, message= FALSE}
+library(dplyr)
+library(terra)  
+library(sf)  
+library(doParallel)  
+library(foreach)   
+library(snow)
+library(osmextract)
+library(ggplot2)
+library(raster)
+library(tidyterra)
+library(cowplot)
+library(RColorBrewer)
+
+rm(list=ls(all=TRUE))
+```
+
+Next, we load the datasets needed to create the friction surface.
+
+---
+
+### Admin boundary
+
+First, we load the administrative boundary of the country we will be processing. In this case, Rwanda. The administrative boundary of Rwanda was downloaded from the GADM website. Also, we have a projections file which relates our country of interest to its EPSG code. It is also possible to have multiple country boundaries for multi-country analysis.
+```{r load admin boundaries, results = FALSE, warning = FALSE, message = FALSE}
+admin <- st_read("Data/Admin/GADM/gadm41_RWA_0.shp") 
+projections <- read.csv("Data/Admin/RWA_projections.csv")
+```
+We then get projection data (proj4 definitions) from EPSG and merge it with our projections data.
+```{r fetch projections, results = FALSE, warning = FALSE, message = FALSE}
+# fetch projection data from EPSG
+epsg <- read.csv("Data/Admin/epsg_codes.csv")
+projections <- left_join(projections, epsg, by = c("epsg_code"  ="code"))
+```
+Finally, we join those projections to our administrative boundary. We also save the country code (GID_0) to be used for file saving later on.
+```{r join projections and admin, results = FALSE, warning = FALSE, message = FALSE}
+# create landcover for each country in ssa
+admin <- left_join(admin, projections, by = c("GID_0" = "country_code")) # merge the projections to the spatial data
+countries <- admin$GID_0
+file_name <- admin$COUNTRY
+```
+We will be using this boundary in the subsequent parts of the data preparation.
+
+```{r plot admin boundary, results = FALSE, warning = FALSE, message = FALSE}
+#Visualize the data
+ggplot()+
+  geom_sf(data = admin,
+          aes(geometry=geometry),
+          color = "blue",
+          size = 1)+
+  ggtitle("Admin boundary") +
+  theme_minimal()
+
+```
+
+---
+
+### Land cover, elevation, slope
+
+Next, we load the land cover dataset from Buchorn et al (2020) DOI: 10.5281/zenodo.3939050.
+To save on memory, we have already clipped the land cover and elevation datasets to Rwanda. However, these datasets are globally available so this exercise can be replicated for any country/area. You would just need to replace the datasets we have provided with the global ones.
+```{r load lc, results = FALSE, warning = FALSE, message = FALSE}
+landcover <- rast("Data/LandCover/RWA_PROBAV_LC100_global_v3.0.1_2019.tif")
+elevation <- rast("Data/Elevation/COPDEM90m_RWA.tif")
+```
+Assuming you have the global datasets, in this next block of code, we take the land cover and elevation data and clip only within our country/countries of interest. And we export that clip to a TIF file. Nevertheless, still run this chunk of code to avoid any confusion with the file names.
+
+```{r clip lc, results = FALSE, warning = FALSE, message = FALSE}
+system.time(for(i in 1:nrow(admin)) {
+  l = landcover
+  e = elevation
+  a = admin %>% 
+    filter(GID_0 == countries[i])
+  a = vect(a)
+  
+  # clip land cover
+  r_l = terra::crop(l, a)
+  m_l = terra::mask(r_l, a)
+  p_l = terra::project(m_l, admin$prj4[i], method = "near")
+  values(p_l)[values(p_l) == 0] <- NA
+  writeRaster(p_l, paste0("Data/Processed/rLandcover/landcover_", countries[i], ".tif"), overwrite=T)
+  
+  # clip elevation
+  r_e = terra::crop(e, a)
+  m_e = terra::mask(r_e, a)
+  p_e = terra::project(m_e, admin$prj4[i], method = "near")
+  writeRaster(p_e, paste0("Data/Processed/rElevation/elevation_", countries[i], ".tif"), overwrite=T)
+
+})
+```
+We can check the written rasters in the "Processed" folder and visualize the land cover and elevation in your preferred GIS software. After clipping the elevation, we calculate the slope.
+
+```{r calc slope, results = FALSE, warning = FALSE, message = FALSE}
+for(i in 1:nrow(admin)){
+  # load in elevation
+  elevation <- rast(paste0("Data/Processed/rElevation/elevation_", countries[i], ".tif"))
+  slope <- terrain(elevation, v="slope")
+  
+  writeRaster(slope, paste0("Data/Processed/rSlope/slope_", countries[1], "_terra.tif"), overwrite=T)
+}
+
+```
+
+Here, we then visualize the clipped elevation, land cover, and slope.
+
+```{r plot elev lc slope, results = FALSE, warning = FALSE, message = FALSE}
+#Visualize the data
+ggplot()+
+  geom_spatraster(data=p_l, aes(fill=!!!names(p_l)))+
+  scale_fill_hypso_c()+
+  ggtitle("Land cover")
+ggplot()+
+  geom_spatraster(data=p_e, aes(fill=!!!names(p_e)))+
+  scale_fill_terrain_c()+
+  ggtitle("Elevation")
+ggplot()+
+  geom_spatraster(data=slope, aes(fill=!!!names(slope)))+
+  scale_fill_viridis_c()+
+  ggtitle("Slope")
+
+```
+
+---
+
+### OpenStreetMap data
+
+---
+
+Since we will be getting our data for roads, waterways, and waterbodies from OpenStreetMap, we will first prepare our queries for each of these datasets.
+
+#### Queries
+
+```{r prepare queries, results = FALSE, warning = FALSE, message = FALSE}
+road_query = "SELECT * FROM 'lines' WHERE highway IS NOT NULL"
+waterway_query = "SELECT * FROM 'lines' WHERE waterway IS NOT NULL AND waterway == 'river'" # here, we only take the main river line and exclude streams and other small waterways
+waterbody_query = "SELECT * FROM 'multipolygons' WHERE water IS NOT NULL"
+```
+
+---
+
+#### Extracting data
+
+For more efficient processing, we want to do parallel processing and use multiple (but not all!) of our computer's resources.
+
+```{r assign resources, results = FALSE, warning = FALSE, message = FALSE}
+# assign cores for parallel processing 
+cores <- 3 # not to overload your computer
+cl <- makeCluster(cores) 
+registerDoParallel(cl)
+```
+      
+Then, using the query we built for each dataset, we take the roads, waterways, and water bodies only within the country/countries of interest. We do this by looping through all the countries but in this case, we only have one country: Rwanda.
+      
+```{r extract OSM data, results = FALSE, warning = FALSE, message = FALSE}
+# system.time(foreach(i = 1:length(admin), .packages= c("sf", "osmextract")) %dopar% {
+  # Get the data using the query
+for(i in seq(1:nrow(admin))){
+  roads = oe_get(
+    paste(file_name[i]),
+    quiet = FALSE,
+    query = road_query)
+  
+  waterway = oe_get(
+    paste(file_name[i]),
+    quiet = FALSE,
+    query = waterway_query)
+  
+  waterbody = oe_get(
+    paste(file_name[i]),
+    extra_tags = c("water"),
+    quiet = FALSE,
+    query = waterbody_query)
+  
+  st_crs(roads) = st_crs(admin)
+  st_crs(waterway) = st_crs(admin)
+  st_crs(waterbody) = st_crs(admin)
+  
+  roads = st_transform(roads, crs=admin$prj4[i])
+  waterway = st_transform(waterway, crs=admin$prj4[i])
+  waterbody = st_transform(waterbody, crs=admin$prj4[i])
+  
+  st_write(roads, paste0("Data/Processed/vRoads/Roads_", countries[i], ".shp"),delete_dsn=T)
+  st_write(waterway, paste0("Data/Processed/vWater_lines/Water_lines_", countries[i], ".shp"), append = F, delete_dsn=T)
+  st_write(waterbody, paste0("Data/Processed/vWater_poly/Water_poly_", countries[i], ".shp"), append = F, delete_dsn=T)
+}
+```
+We can now inspect the vector outputs from OSM.
+
+```{r plot OSM, results = FALSE, warning = FALSE, message = FALSE}
+ggplot()+
+  geom_sf(data = roads, aes(geometry = geometry), color = "gray", size=0.15)+
+  geom_sf(data = waterbody, aes(geometry = geometry), fill = "lightblue", color=NA, size=0.5)+
+  geom_sf(data = waterway, aes(geometry = geometry), color = "blue", size=0.25)+
+  geom_sf(data = admin, aes(geometry = geometry), color = "black", fill=NA, size=1)+
+  ggtitle("OpenStreetMap layers")
+```
+
+This is the end of the individual dataset preparation.
+
+---
+
+## Merging datasets
+
+In this phase, we merge the landcover, roads, waterways, and waterbodies.
+
+```{r load all layers, results = FALSE, warning = FALSE, message = FALSE}
+# load in data layers
+# the administrative boundaries can be adapted to personal requirements. Here we used the GADM boundaries:
+# available from: https://gadm.org/data.html 
+landcover <- c(list.files("Data/Processed/rLandcover", recursive = T, full.names = T, pattern = "*.tif$"))
+roads <- c(list.files("Data/Processed/vRoads", recursive = T, full.names = T, pattern = "*.shp$"))
+water_lines <- c(list.files("Data/Processed/vWater_lines", recursive = T, full.names = T, pattern = "*.shp$"))
+water_poly <- c(list.files("Data/Processed/vWater_poly", recursive = T, full.names = T, pattern = "*.shp$"))
+```
+
+We first list all the road classes that are found in the OSM road data and reclassify each class to an integer value.
+
+```{r define road classes, results = FALSE, warning = FALSE, message = FALSE}
+road_classes <- c("motorway", "trunk", "primary", "secondary", "tertiary",
+                  "unclassified", "residential", "motorway_link", "trunk_link",
+                  "primary_link", "secondary_link", "tertiary_link", "living_street",
+                  "service", "pedestrian", "track", "road", "footway", "bridleway",
+                  "steps", "path", "cycleway", "raceway", "unclassified", "bridge")
+
+reclass_roads <- list(
+  "trunk" = 1001,
+  "trunk_link" = 1002,
+  "primary" = 1003,
+  "primary_link"= 1004,
+  "motorway" = 1005,
+  "motorway_link" = 1006,
+  "secondary" = 1007,
+  "secondary_link" = 1008,
+  "tertiary" = 1009,
+  "tertiary_link" = 1010,
+  "road" = 1011,
+  "raceway" = 1012,
+  "residential" = 1013,
+  "living_street" = 1014,
+  "service" = 1015,
+  "track" = 1016,
+  "pedestrian" = 1017,
+  "path" = 1018,
+  "footway" = 1019,
+  "piste" = 1020,
+  "bridleway" = 1021,
+  "cycleway" = 1022,
+  "steps" = 1023,
+  "unclassified" = 1024,
+  "bridge" = 1025)
+```
+
+The next function will merge all the datasets. All vector data will be rasterized at 100m spatial resolution to match the land cover data. Waterways (in this case, main river lines) and waterbodies (lakes and larger rivers), will serve as barriers so will be set to NA.
+
+```{r define lc merge, results = FALSE, warning = FALSE, message = FALSE}
+
+landcover_merge_function <- function(i) {
+  landcov <- rast(landcover[i]) # load landcover raster
+  grid_landcov <- rast(ext(landcov)) 
+  res(grid_landcov) <- 100
+  crs(grid_landcov) <- crs(landcov)
+  landcover_resamp  <- resample(landcov, grid_landcov, "near") # resample landcover to 100m
+  
+  roads_new <- st_read(roads[i]) %>%
+    group_by(highway) %>%
+    summarize() %>%
+    filter(highway %in% as.factor(road_classes)) %>%
+    mutate(class = recode(highway, !!!reclass_roads),
+           class = as.integer(class)) %>% # give all road classes an integer value, so they can be represented in the raster
+    st_transform(st_crs(landcov)) %>%
+    vect()
+  roads_rast <- terra::rasterize(roads_new, grid_landcov, "class", touches = TRUE) # rasterize roads to 100 meters
+  
+  water_lines_new <- st_read(water_lines[i]) %>% # load water lines
+    group_by(waterway) %>%
+    summarize() %>%
+    filter(waterway == "river") %>% # filter only hydrography lines classified as river
+    mutate(class = 80) %>% # give all rivers and integer class 1 so that later they can be classified as barriers
+    st_transform(st_crs(landcov)) %>%
+    vect()
+  water_lines_rast <- terra::rasterize(water_lines_new, grid_landcov, field = "class", touches = TRUE) # rasterize water lines
+  values(water_lines_rast)[values(water_lines_rast) == 0] <- NA # make background value NA
+  
+  water_poly_new <- st_read(water_poly[i]) %>% # load water polygons
+    mutate(class = 80) %>% # give all rivers and lakes integer class 1 so that later they can be classified as barriers
+    st_transform(st_crs(landcov)) %>%
+    vect()
+  water_poly_rast <- terra::rasterize(water_poly_new, grid_landcov, "class", touches = TRUE) # rasterize water polygons
+  values(water_poly_rast)[values(water_poly_rast) == 0] <- NA # make background value NA
+  
+  # add in the following sequence from bottom to top all the raster layers (landcover, water lines, water polygons, roads)
+  landcover_merge <- terra::merge(water_lines_rast, landcover_resamp)
+  landcover_merge <- terra::merge(water_poly_rast, landcover_merge)
+  landcover_merge <- terra::merge(roads_rast, landcover_merge)
+  # all values that are 1 represent waterbodies, set to 80 or the class of permanent waterbodies
+  #values(landcover_merge)[values(landcover_merge) == 1] <- 80
+  
+  # export the merged layer to a TIF
+  writeRaster(landcover_merge, paste0("Data/Processed/rLandcover_merge/landcover_merge_", file_name[i], ".tif"), overwrite=T)
+}
+```
+
+Before we run the function, we prepare our computer by assigning resources and also providing a temporary folder to keep intermediate outputs to prevent using too much memory in the R environment.
+
+```{r assign resources for merge, results = FALSE, warning = FALSE, message = FALSE}
+# parallel processing of landcover merge
+cores <- 3 # not to overload your computer
+cl <- makeCluster(cores) 
+registerDoParallel(cl)
+terraOptions(tempdir="/temp/") # set temporary folder for data processing, so R environment does not have memory issues
+```
+
+Here, we run the function we just defined above.
+
+```{r run land cover merge, results = FALSE, warning = FALSE, message = FALSE}
+system.time(foreach(i = 1:length(landcover),
+                    .packages= c("sf", "dplyr", "terra")) 
+                    %dopar% {landcover_merge_function(i)})
+```
+
+Finally, we can visualize the merged land cover raster. You can also visualize this in your preferred GIS software.
+
+```{r plot lc merge, results = FALSE, warning = FALSE, message = FALSE}
+lc_merge <- rast(paste0("Data/Processed/rLandcover_merge/landcover_merge_", file_name[i], ".tif"))
+
+ggplot()+
+  geom_spatraster(data=lc_merge, aes(fill=!!!names(lc_merge)))+
+  scale_fill_hypso_c()+
+  ggtitle("Merged Land Cover")
+```
+
+This is the end of the data preparation segment. 
+
+---
+
+## Creating the friction surface
+
+Next, we will use this dataset to create the friction surface. We will also need additional libraries for the next steps. Here, we load them.
+
+```{r load addtl libs, results = FALSE, warning = FALSE, message = FALSE}
+library(readxl)
+library(plyr)
+library(terra)
+```
+
+We also reset and remove existing variables again to avoid any confusion.
+
+```{r reset for friction, results = FALSE, warning = FALSE, message = FALSE}
+rm(list=ls(all=TRUE))
+```
+
+In this process, first we load the admin boundaries of our country of interest and the merged land cover file we created in the previous step.
+
+```{r load merged lc and admin, results = FALSE, warning = FALSE, message = FALSE}
+admin <- st_read("Data/Admin/GADM/gadm41_RWA_0.shp")
+projections <- read.csv("Data/Admin/RWA_projections.csv")
+# fetch projection data from EPSG
+epsg <- read.csv("Data/Admin/epsg_codes.csv")
+projections <- left_join(projections, epsg, by = c("epsg_code"  ="code"))
+admin <- left_join(admin, projections, by = c("GID_0" = "country_code")) # merge the projections to the spatial data
+
+landcover <- c(list.files("Data/Processed/rLandcover_merge", recursive = T, full.names = T, pattern = "*.tif$")) # land cover merge for each country
+elev <- c(list.files("Data/Processed/rElevation", recursive = T, full.names = T, pattern = "*.tif$"))
+slop <- c(list.files("Data/Processed/rSlope", recursive = T, full.names = T, pattern = "*.tif$"))
+```
+
+## Speed data
+
+Then we load two spreadsheets. The first defines the speeds per road class and second 
+defines the speeds per land cover class.
+
+The speeds per road class were taken from Weiss et al. (2020) and are specific to each country but also provide a global default. Below are the speeds for Rwanda.
+
+---
+
+Road Class | Speed (km/h)
+------------- | -------------
+trunk | 40
+primary | 40
+secondary | 40
+tertiary | 40
+unclassified | 40
+residential | 40
+service | 35
+track | 40
+other | 40
+
+---
+
+The speeds per land cover class were taken from Weiss et al. (2018) and are general, which means they don't vary from country to country. Below are the speeds per land cover class.
+
+---
+
+Land Cover Class | Speed (km/h)
+------------- | -------------
+unknown | 3
+shrubs | 3.6
+herbaceous vegetation | 3.24
+cultivated/agriculture | 2.5
+urban/built up | 5
+bare/sparse vegetation | 3
+snow and ice | 1.62
+permanent waterbodies | 2
+unclassified | 3
+herbaceous wetland | 2
+moss and lichen | 3.24
+closed forest, evergreen needle leaf | 3.24
+closed forest, evergreen broad leaf | 1.62
+closed forest, deciduous needle leaf | 3.24
+closed forest, deciduous broad leaf | 4
+closed forest, mixed | 3.24
+closed forest, not matching other definitions | 3.07
+open forest, evergreen needle leaf | 3.24
+open forest, evergreen broad leaf | 1.62
+open forest, deciduous needle leaf | 3.24
+open forest, deciduous broad leaf | 4
+open forest,  mixed | 3.24
+open forest, not matching other definitions | 3.07
+oceans, seas | 1
+
+---
+
+Load the spreadsheets containing the different speeds.
+
+```{r load speeds, results = FALSE, warning = FALSE, message = FALSE}
+travelspeeds <- read_xlsx("Data/Weiss2020_OSM_speedsFriction.xlsx", 
+                          sheet = "Sheet1") # speeds coming from Weiss et al (2020)
+landcoverspeeds <- read_xlsx("Data/Weiss2018_LC_speedsFriction.xlsx") # table containing the speeds for the different land cover classes 
+
+```
+
+Subset the country names, road classes, and land cover classes
+
+```{r take subset, results = FALSE, warning = FALSE, message = FALSE}
+
+countries <- admin$GID_0
+road_classes <- c(1001:1025)
+landcover_classes <- landcoverspeeds$Class
+
+```
+
+## Joining roads and land cover with speed data
+
+Create a data frame with countries and road classes so a travel scenario can be extracted for each country using the road speeds from Weiss et al. (2020). If the class does not have a match in the Weiss et al. (2020) sheet, we use the speed defined in the "other" class. Lastly, we do a conversion of the speed from km/h to min/m.
+
+```{r convert road class speeds, results = FALSE, warning = FALSE, message = FALSE}
+countries <- rep(countries, each = length(road_classes))
+road_classes <- rep(road_classes, length(unique(countries)))
+data_roads <- data.frame(country = countries, road_class = road_classes) %>%
+  mutate(osm_class = recode(road_class,  
+                        '1001' = "trunk",
+                        '1002' = "trunk_link",
+                        '1003' = "primary",
+                        '1004' = "primary_link",
+                        '1005' = "motorway",
+                        '1006' = "motorway_link",
+                        '1007' = "secondary",
+                        '1008' = "secondary_link",
+                        '1009' = "tertiary",
+                        '1010' = "tertiary_link",
+                        '1011' = "road",
+                        '1012' = "raceway",
+                        '1013' = "residential",
+                        '1014' = "living_street",
+                        '1015' = "service",
+                        '1016' = "track",
+                        '1017' = "pedestrian",
+                        '1018' = "path",
+                        '1019' = "footway",
+                        '1020' = "piste",
+                        '1021' = "bridleway",
+                        '1022' = "cycleway",
+                        '1023' = "steps",
+                        '1024' = "unclassified",
+                        '1025' = "bridge")) %>% # reclassify the different road classes
+  left_join(., travelspeeds, by = c("country" = "ISO3", "osm_class" = "osm_class")) %>% # merge the empty table with the Weiss et al table
+  mutate(weiss_class = ifelse(is.na(speed) == TRUE, "other", osm_class))  %>% # if Weiss table does not have a speed for a certain category, assign the class "other" to a new column
+  dplyr::select(-c(GAUL, country_name, osm_tag_name, speed)) %>% # only keep important columns
+  left_join(., travelspeeds, by = c("country" = "ISO3", "weiss_class" = "osm_class")) %>% # join travel speeds of weiss again, including the "other" category
+  mutate(conversion = ((60*1)/(speed*1000))) %>%  # the input of the accessibility analysis, requires a time cost of traversing one cell per meter. For 100m we change the first 1 to 100 for conversion.
+  dplyr::select(c(country, country_name, osm_class, weiss_class, road_class, speed, conversion))
+```
+
+Now we do the same thing for the land cover classes and speeds.
+
+```{r convert land cover speeds, results = FALSE, warning = FALSE, message = FALSE}
+# create data frame for land cover classes
+countries <- admin$GID_0
+countries <- rep(countries, each = length(landcover_classes))
+landcover_classes <- rep(landcover_classes, length(unique(countries)))
+
+data_landcover <- data.frame(country = countries, landcover_class = landcover_classes) %>%
+  mutate(landcover_label = recode(landcover_class, 
+                            '0'   = "unknown",
+                            '20'  = "shrubs",
+                            '30'  = "herbaceous vegetation",
+                            '40'  = "cultivated/agriculture",
+                            '50'  = "urban/built up",
+                            '60'  = "bare/sparse vegetation",
+                            '70'  = "snow and ice",
+                            '80'  = "permanent waterbodies",
+                            '81'  = "unclassified",
+                            '90'  = "herbaceous wetland",
+                            '100' = "moss and lichen",
+                            '111' = "closed forest, evergreen needle leaf",
+                            '112' = "closed forest, evergreen broad leaf",
+                            '113' = "closed forest, deciduous needle leaf",
+                            '114' = "closed forest, deciduous broad leaf",
+                            '115' = "closed forest, mixed",
+                            '116' = "closed forest, not matching other definitions",
+                            '121' = "open forest, evergreen needle leaf",
+                            '122' = "open forest, evergreen broad leaf",
+                            '123' = "open forest, deciduous needle leaf",
+                            '124' = "open forest, deciduous needle leaf",
+                            '125' = "open forest, mixed",
+                            '126' = "open forest, not matching other definitions",
+                            '200' = "oceans, seas")) %>%
+  left_join(., landcoverspeeds, by = c("landcover_class" = "Class")) %>%
+  dplyr::select(-c(Label)) %>%
+  mutate(conversion = ((60*1)/(speed*1000)))
+```
+
+Here, we merge both road and land cover speeds into one list.
+
+```{r merge speeds, results = FALSE, warning = FALSE, message = FALSE}
+# split the full travel speed dataframe into separate list items
+speeds_roads <- data_roads %>%
+  dplyr::select(c(country, road_class, speed)) %>%
+  dplyr::rename(class = "road_class")
+speeds_landcover <- data_landcover %>%
+  dplyr::select(c(country, landcover_class, speed)) %>%
+  dplyr::rename(class = "landcover_class")
+speeds <- rbind(speeds_roads, speeds_landcover) # merge both datasets
+speeds_list <- list()
+speeds_list <- split(speeds , f = speeds$country)
+speeds_list <- lapply(speeds_list, function(x) { x["country"] <- NULL; x})
+```
+
+Then we resample the elevation and slope rasters to match the newly created merged land cover dataset. These two rasters will be used in the calculation of the friction surface as adjustment factors.
+
+```{r load elevation and slope, results = FALSE, warning = FALSE, message = FALSE}
+
+# process elevation and slope
+for(i in seq(1:nrow(admin))){
+  landcover_merge <- rast(landcover[i]) # reference image
+
+  elev_in <- rast(elev[i])
+  grid_elev <- rast(ext(landcover_merge))
+  res(grid_elev) <- 100
+  crs(grid_elev) <- crs(landcover_merge)
+  elevation  <- resample(elev_in, grid_elev) # resample elev to 100m
+  
+  slo_in <- rast(slop[i])
+  grid_slo <- rast(ext(landcover_merge))
+  res(grid_slo) <- 100
+  crs(grid_slo) <- crs(landcover_merge)
+  slope  <- resample(slo_in, grid_slo) # resample slope to 100m
+}
+```
+
+Similar to previous runs, we allocate computing resources before running.
+
+```{r assign resources for friction, results = FALSE, warning = FALSE, message = FALSE}
+cores <- 2 # not to overload your computer
+cl <- makeCluster(cores) 
+registerDoParallel(cl)
+```
+
+## Calculating the friction surface
+
+And finally, we calculate the friction surface. For land cover classes that are not roads, we multiply the speed with an elevation adjustment factor and slope adjustment factor, as explained in Weiss et al (2018).
+
+```{r calc friction, results = FALSE, warning = FALSE, message = FALSE}
+landcover_merge <- rast(landcover[1])
+landcover_speed_orig <- classify(landcover_merge, speeds_list[[1]])
+
+landcover_friction_orig <- 60/(landcover_speed_orig*1000)
+
+admin_p <- st_transform(admin, admin$prj4[1])
+admin_p = vect(admin_p)
+
+landcover_friction_orig_c <- terra::crop(landcover_friction_orig, admin_p)
+landcover_friction_orig_m <- terra::mask(landcover_friction_orig_c, admin_p)
+
+# Only apply elevation adjustment factor to land cover classes that are not roads (class id < 1000)
+
+# elevation adjustment factor
+elev_adj <- 1.016*exp(-0.0001072*elevation[landcover_merge < 1000])
+
+# slope adjustment factor
+#   convert slope from degrees to radians (*0.01745) and applying tan() function
+#   calculate Tobler's walking speed (6e(-3.5*|tan(theta|))
+#   percentage of max walking speed = 5 km/h
+slope_adj <- (6*exp(-3.5*abs(tan(0.01745*slope[landcover_merge < 1000])+0.05)))/5
+
+# adjust land cover dependent speeds by elevation and slope adjustment factors
+landcover_speed_adj <- landcover_speed_orig
+landcover_speed_adj[landcover_merge < 1000] <- 
+  landcover_speed_adj[landcover_merge < 1000]*elev_adj*slope_adj
+landcover_friction_adj <- 60/(landcover_speed_adj*1000)
+
+landcover_friction_adj_c <- terra::crop(landcover_friction_adj, admin_p)
+landcover_friction_adj_m <- terra::mask(landcover_friction_adj_c, admin_p)
+friction_fname <- paste0("Data/Processed/rFriction_100m/friction_", countries[1], ".tif")
+writeRaster(landcover_friction_adj_m, friction_fname,overwrite = T)
+
+```
+
+We now have a 100m resolution friction surface representing how many minutes it takes to travel one meter in that cell.
+
+```{r plot friction, results = FALSE, warning = FALSE, message = FALSE}
+ggplot()+
+  geom_spatraster(data=landcover_friction_adj_m, aes(fill=!!!names(landcover_friction_adj_m)))+
+  scale_fill_viridis_c(option="B", limits=c(0,1))+
+  ggtitle("Friction surface")
+
+```
+## Calculating travel time to markets
+
+Now that we have the friction surface, we can then calculate travel time to certain points of interest.
+
+First, we will install the custom library that allows us to create the travel time surface. When prompted if you would like to update, please choose 1 (All). Installation should take about 1-2 minutes depending on your machine. If you have already installed the custom rtravelcost library, you can skip this section.
+
+```{r custom lib install, results = FALSE, warning = FALSE, message = FALSE}
+# Download the custom library folder
+download.file(
+  "https://github.com/enzocampomanesv/friction-travel-time-data/blob/main/utils/rtravelcost-main.zip?raw=TRUE",
+  "rtravelcost-main.zip",
+  mode = "wb"
+)
+
+# Extract the zip file
+unzip("rtravelcost-main.zip", exdir="rtravelcost-main")
+library(devtools)
+# Save original working directory
+install(paste0(dirname(getActiveDocumentContext()$path),'\\rtravelcost-main\\rtravelcost-main'))
+```
+
+After installing the custom R library called rtravelcost, we will now load it.
+
+```{r load rtravelcost, results = FALSE, warning = FALSE, message = FALSE}
+library(rtravelcost)
+library(raster)
+```
+
+Using the friction surface, we will create a travel time raster to specific points of interest. We will run a Python script that takes as input the friction surface dataset and a point dataset. For this case, we will use market locations in Rwanda as our points of interest. 
+
+```{r calc travel time sheds, results = FALSE, warning = FALSE, message = FALSE}
+memory.limit(999999999999)
+memory.size(999999999999)
+markets <- "Data/GHSL/GHS_SMOD_2020_RWA_U_IITAWFP_point.shp"
+dir.create("Outputs/")
+travel_time <- accumcosts(x = friction_fname,
+                          y = markets,
+                          # Travel time raster output
+                          outputpath1="Outputs/travelTime_mins.tif",
+                          # Travel time sheds output
+                          outputpath2="Outputs/travelTime_shed.tif",
+                          directions = 8,
+                          nblocks = 1,
+                          format="GTiff",
+                          field="Id",
+                          rollX=FALSE,
+                          rollY=FALSE
+                          )
+
+```
+We were able to use our 100m resolution friction surface to create (1) a travel time to markets surface at the same resolution and (2) a travel time shed raster.
+
+```{r plot travel time, results = FALSE, warning = FALSE, message = FALSE}
+travel_time <- rast("Outputs/travelTime_mins.tif")
+travel_time_m <- terra::mask(travel_time, admin_p)
+ggplot()+
+  geom_spatraster(data=travel_time_m,
+                  aes(fill=!!!names(travel_time_m)))+
+  geom_sf(data= st_read(markets, quiet=TRUE),
+          aes(geometry=geometry),
+          color="red",
+          fill="red",
+          size=2)+
+  geom_sf(data = admin_p,
+          aes(geometry=geometry),
+          color = "black",
+          fill = NA,
+          size = 1)+
+  scale_fill_viridis_c(option="A", direction = -1, limits=c(0, 180))+
+  ggtitle("Travel time (mins)")
+
+travel_time_sheds <- rast("Outputs/travelTime_shed.tif")
+travel_time_sheds_m <- terra::mask(travel_time_sheds, admin_p)
+ggplot()+
+  geom_spatraster(data=travel_time_sheds_m,
+                  aes(fill=!!!names(travel_time_sheds_m)))+
+  geom_sf(data= st_read(markets, quiet=TRUE),
+          aes(geometry=geometry),
+          color="red",
+          fill="red",
+          size=2)+
+  geom_sf(data = admin_p,
+          aes(geometry=geometry),
+          color = "black",
+          fill = NA,
+          size = 1)+
+  scale_fill_gradientn(colors= brewer.pal(8, "Set2"))+
+  ggtitle("Travel time sheds")
+```
+
+## THE END!
